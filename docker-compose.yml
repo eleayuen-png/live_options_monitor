@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  # 1. The Headless IB Gateway Server
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:latest
+    container_name: ib_gateway
+    ports:
+      - "4002:4002"  # Port 4002 is the standard for Gateway Paper Trading
+    environment:
+      - TWS_USERID=${IBKR_USER}
+      - TWS_PASSWORD=${IBKR_PASS}
+      - TRADING_MODE=${TRADING_MODE}
+      - VNC_SERVER_PASSWORD=secret # Optional: Allows you to visually inspect the headless UI via VNC
+    restart: unless-stopped
+
+  # 2. Your Python Bot
+  options_oms:
+    build: .
+    container_name: quant_options_monitor
+    ports:
+      - "8505:8505"
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src
+    restart: unless-stopped
+    depends_on:
+      - ib-gateway # Tells Docker to start the Gateway BEFORE starting your bot
+
