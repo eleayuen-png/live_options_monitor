@@ -74,14 +74,28 @@ async def run_ibkr_streamer_background(watchlist: list, target_queue: asyncio.Qu
                     logger.warning(f"⚠️ [{symbol}] no expiry ≥{MIN_DTE}DTE available; using {nearest_exp}")
                 
                 # 4. 尋找最平價的履約價 (ATM Strike)
-                strikes = sorted(chain.strikes)
-                atm_strike = min(strikes, key=lambda x: abs(x - spot_price))
-                
-                # 5. 建立合約
-                call = Option(symbol, nearest_exp, atm_strike, 'C', 'SMART')
-                put = Option(symbol, nearest_exp, atm_strike, 'P', 'SMART')
+                # Try the closest strike first, then walk outward until we find
+                # a pair that IBKR can actually qualify (some strikes in the
+                # chain metadata don't have listed contracts for every expiry).
+                strikes = sorted(chain.strikes, key=lambda x: abs(x - spot_price))
+                qualified_pair = None
+                for candidate_strike in strikes[:5]:  # try up to 5 nearest strikes
+                    call = Option(symbol, nearest_exp, candidate_strike, 'C', 'SMART')
+                    put  = Option(symbol, nearest_exp, candidate_strike, 'P', 'SMART')
+                    try:
+                        qualified = await ib.qualifyContractsAsync(call, put)
+                        if len(qualified) == 2:
+                            qualified_pair = (call, put, candidate_strike)
+                            break
+                    except Exception:
+                        pass
+
+                if qualified_pair is None:
+                    logger.warning(f"⚠️ [{symbol}] Could not qualify any ATM strike near ${spot_price:.2f} for {nearest_exp}. Skipping.")
+                    continue
+
+                call, put, atm_strike = qualified_pair
                 active_contracts.extend([call, put])
-                
                 logger.info(f"🎯 [{symbol}] Found ATM Strike: ${atm_strike} for Expiry: {nearest_exp}")
                 
             except Exception as e:
@@ -91,8 +105,6 @@ async def run_ibkr_streamer_background(watchlist: list, target_queue: asyncio.Qu
             logger.error("❌ No valid options contracts built. Halting streamer.")
             return
 
-        # 驗證所有建立的合約
-        await ib.qualifyContractsAsync(*active_contracts)
         logger.info(f"📡 Subscribing to {len(active_contracts)} live option streams...")
 
         # 請求市場數據
