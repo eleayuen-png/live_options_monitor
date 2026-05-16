@@ -1,12 +1,20 @@
 import asyncio
 import logging
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 from ib_insync import IB, Stock, Option
 
 logger = logging.getLogger(__name__)
 
+# Minimum days-to-expiry for the option we stream. ATM 0DTE/1DTE options have
+# wildly distorted IVs (pinning, theta cliff) that are structurally always
+# "rich" vs realized vol, so they generate no BUY signals under the long-only
+# RV-IV>0.05 threshold. ~14-30 DTE is the standard vol-arb sweet spot.
+MIN_DTE = int(os.getenv("MIN_DTE", "14"))
+
+
 # --- 將 host 與 port 的預設值改為 ib-gateway 與 4002 ---
-async def run_ibkr_streamer_background(watchlist: list, target_queue: asyncio.Queue, host='ib-gateway', port=4002, client_id=2):
+async def run_ibkr_streamer_background(watchlist: list, target_queue: asyncio.Queue, host='ib-gateway', port=4002, client_id=2, on_connect=None):
     """
     Connects to IBKR TWS, dynamically requests Option Chains, 
     finds At-The-Money (ATM) options for the nearest expiration, 
@@ -14,11 +22,16 @@ async def run_ibkr_streamer_background(watchlist: list, target_queue: asyncio.Qu
     """
     ib = IB()
     try:
-        await ib.connectAsync(host, port, clientId=client_id)
+        await ib.connectAsync(host, port, clientId=client_id, timeout=20)
         logger.info("✅ IBKR Market Data Streamer Connected!")
-        
+
+        if on_connect is not None:
+            on_connect(ib)
+
+        ib.disconnectedEvent += lambda: logger.warning("⚠️ IBKR disconnectedEvent fired — streamer will exit and reconnect")
+
         # 1 = Live, 3 = Delayed (Force Live for Arbitrage)
-        ib.reqMarketDataType(1) 
+        ib.reqMarketDataType(1)
         
         active_contracts = []
         
@@ -44,12 +57,21 @@ async def run_ibkr_streamer_background(watchlist: list, target_queue: asyncio.Qu
                 # 選擇 SMART 交易所的選擇權鏈
                 chain = next((c for c in chains if c.exchange == 'SMART'), chains[0])
                 
-                # 3. 尋找最近的未來到期日 (Nearest Expiration)
+                # 3. Pick an expiry at least MIN_DTE days out (default 14).
+                # 0DTE/1DTE ATM options have distorted IVs that never satisfy
+                # the long-only BUY signal — skip them. Fall back to the
+                # nearest available if no expiry is far enough out.
+                min_exp_str = (datetime.now() + timedelta(days=MIN_DTE)).strftime('%Y%m%d')
                 today_str = datetime.now().strftime('%Y%m%d')
-                valid_expirations = sorted([exp for exp in chain.expirations if exp >= today_str])
-                if not valid_expirations:
-                    continue
-                nearest_exp = valid_expirations[0] # 取最靠近今天的到期日
+                far_enough = sorted([exp for exp in chain.expirations if exp >= min_exp_str])
+                if far_enough:
+                    nearest_exp = far_enough[0]
+                else:
+                    fallback = sorted([exp for exp in chain.expirations if exp >= today_str])
+                    if not fallback:
+                        continue
+                    nearest_exp = fallback[0]
+                    logger.warning(f"⚠️ [{symbol}] no expiry ≥{MIN_DTE}DTE available; using {nearest_exp}")
                 
                 # 4. 尋找最平價的履約價 (ATM Strike)
                 strikes = sorted(chain.strikes)
@@ -77,8 +99,8 @@ async def run_ibkr_streamer_background(watchlist: list, target_queue: asyncio.Qu
         tickers = [ib.reqMktData(contract, '', False, False) for contract in active_contracts]
 
         # 無窮迴圈，持續將跳動的 Ticks 塞入 Queue 中給 Dashboard
-        while True:
-            await asyncio.sleep(0.5) 
+        while ib.isConnected():
+            await asyncio.sleep(0.5)
             
             for ticker in tickers:
                 if ticker.bid != ticker.bid or ticker.ask != ticker.ask or ticker.bid <= 0:
@@ -115,7 +137,12 @@ async def run_ibkr_streamer_background(watchlist: list, target_queue: asyncio.Qu
                 }
                 await target_queue.put(tick)
 
+        # Reaching here means ib.isConnected() returned False mid-stream
+        raise ConnectionError("IBKR session lost mid-stream")
+
     except Exception as e:
         logger.error(f"IBKR Streamer crashed: {e}")
+        raise  # propagate to streamer_manager so its backoff fires
     finally:
-        ib.disconnect()
+        if ib.isConnected():
+            ib.disconnect()

@@ -12,4 +12,5 @@ alpaca-py
 matplotlib
 requests
 apscheduler
-ib_insync
+ib_insync==0.9.86
+streamlit-autorefresh==1.0.1

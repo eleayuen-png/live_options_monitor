@@ -1,30 +1,72 @@
 version: '3.8'
 
+# Custom network with a known subnet so we can pin the brain's IP and
+# whitelist it in jts.ini's TrustedIPs.
+networks:
+  trading_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
 services:
-  # 1. The Headless IB Gateway Server
+  # 1. IB Gateway (連線核心)
   ib-gateway:
+    # TODO: replace :latest with a pinned tag (e.g. stable or 10.34.1t) once a
+    # known-good version is confirmed — `:latest` silently drifts on rebuilds.
     image: ghcr.io/gnzsnz/ib-gateway:latest
     container_name: ib_gateway
     ports:
-      - "4002:4002"  # Port 4002 is the standard for Gateway Paper Trading
+      - "4002:4002"
     environment:
       - TWS_USERID=${IBKR_USER}
       - TWS_PASSWORD=${IBKR_PASS}
       - TRADING_MODE=${TRADING_MODE}
-      - VNC_SERVER_PASSWORD=secret # Optional: Allows you to visually inspect the headless UI via VNC
+      - READ_ONLY_API=no                  # explicit: order placement allowed
+      - BYPASS_WARNING=yes                # auto-dismiss the daily-restart modal that silently blocks the API
+      - AUTO_RESTART_TIME=11:59 PM        # IBKR forces daily restart — pin to off-market hours
+      - TIME_ZONE=America/New_York        # AUTO_RESTART_TIME is interpreted in this TZ
+      - TWOFA_TIMEOUT_ACTION=restart      # if 2FA stalls, restart instead of leaving port open but unusable
+      - SAVE_TWS_SETTINGS=1               # persist "trust this device" between restarts
+      - TWS_ACCEPT_INCOMING=accept        # IBC auto-accepts API connection dialogs (defense in depth)
+    networks:
+      - trading_net
+    # No healthcheck: the gnzsnz image doesn't ship python3 or nc, and the brain's
+    # own wait_for_gateway() in main.py already does an application-level readiness probe.
     restart: unless-stopped
 
-  # 2. Your Python Bot
-  options_oms:
+  # 2. 交易大腦 (無頭背景執行)
+  trading_brain:
     build: .
-    container_name: quant_options_monitor
-    ports:
-      - "8505:8505"
+    container_name: quant_brain
+    command: python src/main.py
     env_file:
       - .env
+    environment:
+      - GW_HOST=127.0.0.1   # brain shares ib-gateway's network namespace → connect via localhost
     volumes:
       - ./src:/app/src
+      - ./data:/app/data
+    # Share ib-gateway's network namespace. The brain's outbound connection to
+    # the API then has source IP 127.0.0.1, which is what IBC hardcodes into
+    # jts.ini's TrustedIPs (and rewrites back every startup, no matter what
+    # we mount). This sidesteps that entire fight.
+    network_mode: "service:ib-gateway"
     restart: unless-stopped
     depends_on:
-      - ib-gateway # Tells Docker to start the Gateway BEFORE starting your bot
+      - ib-gateway
 
+  # 3. 監視器 UI (純視覺化)
+  trading_ui:
+    build: .
+    container_name: quant_dashboard
+    # 補上 --server.port=8505 與 --server.address=0.0.0.0 讓它在正確的通道廣播
+    command: sh -c "pip install streamlit-autorefresh==1.0.1 && streamlit run src/dashboard.py --server.port=8505 --server.address=0.0.0.0"
+    ports:
+      - "8505:8505"
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data       # <-- UI 也掛載同一個 data 資料夾來讀取檔案
+    networks:
+      - trading_net
+    restart: unless-stopped

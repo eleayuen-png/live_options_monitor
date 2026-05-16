@@ -1,103 +1,71 @@
 """
-Options Strategy & Alpha Engine - IBKR Native Edition
-
-Features:
-- Dynamic Realized Volatility Calculation via IBKR Historical Data (Isolated Connection)
-- Statistical Arbitrage (IV vs RV) Signal Generation
+Options Strategy & Alpha Engine
+Final Stable Version - Fixed Imports and Client ID logic.
 """
 
 import logging
 import asyncio
-import random
 import numpy as np
 import pandas as pd
 from typing import List, Dict
 from ib_insync import IB, Stock, util
 
-from src.streamer import OptionTick
+# Use relative-style import or ensure sys.path in main.py covers this
+try:
+    from src.streamer import OptionTick
+except ImportError:
+    # Fallback if running as standalone
+    from streamer import OptionTick
 
 logger = logging.getLogger(__name__)
 
 class DynamicVolatilityEngine:
-    """
-    Downloads historical data via IBKR and calculates rolling Realized Volatility (RV).
-    """
-    # --- CRITICAL FIX: Updated default host and port to use the new IB Gateway ---
-    def __init__(self, host='ib-gateway', port=4002):
+    def __init__(self, host='ib-gateway', port=4002, on_connect=None):
         self.host = host
         self.port = port
+        self.on_connect = on_connect
         self.rv_cache: Dict[str, float] = {}
 
-    def calculate_30d_rv(self, symbols: List[str]) -> Dict[str, float]:
-        """
-        Synchronous fetch using an ISOLATED, temporary IBKR connection.
-        """
-        logger.info(f"Downloading IBKR historical data for: {symbols}")
-        
-        isolated_ib = IB()
-        client_id = random.randint(5000, 9999) 
-        
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
+    async def calculate_30d_rv_async(self, symbols: List[str]) -> Dict[str, float]:
+        """Fetch historical data using a high Client ID to avoid TWS conflicts."""
+        ib = IB()
         try:
-            # --- Connect using the dynamic variables (ib-gateway:4002) ---
-            isolated_ib.connect(self.host, self.port, clientId=client_id, timeout=10)
-            logger.info(f"🔌 Isolated Strategy connection established (Client ID: {client_id})")
-        except Exception as e:
-            logger.error(f"❌ Isolated Strategy connection failed: {e}")
-            return {sym: 0.20 for sym in symbols} 
-
-        try:
+            logger.info(f"🔌 Connecting to IBKR for historical data...")
+            # Use ID 400 for strategy data fetching
+            await ib.connectAsync(self.host, self.port, clientId=400, timeout=30)
+            if self.on_connect is not None:
+                self.on_connect(ib)
+            
             for symbol in symbols:
-                isolated_ib.sleep(1.0) # Pacing
-                
-                success = False
-                for attempt in range(3):
-                    try:
-                        contract = Stock(symbol, 'SMART', 'USD')
-                        isolated_ib.qualifyContracts(contract)
-                        
-                        if not contract.conId:
-                            logger.warning(f"⚠️ Could not qualify {symbol}.")
-                            isolated_ib.sleep(2.0)
-                            continue
-
-                        bars = isolated_ib.reqHistoricalData(
-                            contract,
-                            endDateTime='',
-                            durationStr='45 D',
-                            barSizeSetting='1 day',
-                            whatToShow='ADJUSTED_LAST',
-                            useRTH=True,
-                            formatDate=1
-                        )
-                        
-                        if not bars:
-                            logger.warning(f"⚠️ No historical data for {symbol} on attempt {attempt+1}")
-                            isolated_ib.sleep(2.0)
-                            continue
-
+                try:
+                    contract = Stock(symbol, 'SMART', 'USD')
+                    await ib.qualifyContractsAsync(contract)
+                    
+                    bars = await ib.reqHistoricalDataAsync(
+                        contract, endDateTime='', durationStr='45 D',
+                        barSizeSetting='1 day', whatToShow='ADJUSTED_LAST',
+                        useRTH=True, formatDate=1
+                    )
+                    
+                    if bars:
                         df = util.df(bars)
                         df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
-                        annualized_rv = df['log_ret'].std() * np.sqrt(252)
+                        rv = df['log_ret'].std() * np.sqrt(252)
+                        self.rv_cache[symbol] = float(rv)
+                        logger.info(f"✅ [{symbol}] RV Calculated: {rv:.2%}")
+                    else:
+                        self.rv_cache[symbol] = 0.20
                         
-                        self.rv_cache[symbol] = float(annualized_rv)
-                        logger.info(f"✅ [{symbol}] IBKR Calculated 30-Day RV: {annualized_rv:.2%}")
-                        success = True
-                        break
-                        
-                    except Exception as e:
-                        logger.warning(f"⏳ Timeout/Error fetching IBKR history for {symbol} (Attempt {attempt+1}/3): {e}")
-                        isolated_ib.sleep(3.0)
-                
-                if not success:
-                    logger.error(f"🛑 Failed to fetch data for {symbol} after 3 attempts. Defaulting to 20% RV.")
+                    await asyncio.sleep(1) 
+                except Exception as e:
+                    logger.warning(f"Error fetching {symbol}: {e}")
                     self.rv_cache[symbol] = 0.20
+        except Exception as e:
+            logger.error(f"Strategy Connection failed: {e}")
         finally:
-            isolated_ib.disconnect()
-            logger.info("🔌 Isolated Strategy connection closed. Handing back to Dashboard.")
-            
+            if ib.isConnected():
+                ib.disconnect()
+                await asyncio.sleep(2) # Let the socket clear
         return self.rv_cache
 
 class VolatilityArbitrage:
@@ -107,27 +75,50 @@ class VolatilityArbitrage:
         self.symbols = symbols
         self.target_rv_map = {}
 
-    def initialize(self):
-        """Synchronous initialization to compute RVs."""
-        self.target_rv_map = self.rv_engine.calculate_30d_rv(self.symbols)
+    async def initialize_async(self):
+        # Retry-with-backoff: a stale clientId=400 slot or mid-restart gateway
+        # can leave the RV cache full of defaults (0.20). Without retry, the
+        # whole run silently runs on those defaults and no signals fire.
+        delay = 5
+        result = {}
+        for attempt in range(5):
+            result = await self.rv_engine.calculate_30d_rv_async(self.symbols)
+            if any(v != 0.20 for v in result.values()):
+                self.target_rv_map = result
+                return
+            logger.warning(f"RV fetch attempt {attempt+1}/5 returned only defaults — retry in {delay}s")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+        logger.error("Strategy failed to fetch real RV data after 5 attempts — running with 20% defaults")
+        self.target_rv_map = result
 
     def generate_signal(self, tick: OptionTick) -> str:
+        """
+        Long-only cash-account strategy:
+          - BUY_TO_OPEN when RV - IV > threshold (option is cheap vs realized vol)
+          - SELL_TO_OPEN is NEVER emitted (cash account cannot short)
+          - HOLD otherwise
+
+        Caller is responsible for separately checking the "fundamental exit"
+        condition via `is_fundamental_exit(tick)` on every tick.
+        """
         if not tick or tick.implied_volatility <= 0:
             return "HOLD"
-            
-        if tick.bid <= 0 or tick.ask <= 0:
-            return "HOLD"
-            
-        spread = tick.ask - tick.bid
-        if spread / tick.mid > 0.20:
-            return "HOLD"
-
         underlying = tick.symbol.rstrip("0123456789CP")
         target_rv = self.target_rv_map.get(underlying, 0.20)
 
-        if tick.implied_volatility > target_rv + self.threshold:
-            return "SELL_TO_OPEN"
-        elif tick.implied_volatility < target_rv - self.threshold:
+        # Long-only: enter when realized > implied + threshold (IV undervalued)
+        if target_rv - tick.implied_volatility > self.threshold:
             return "BUY_TO_OPEN"
-            
         return "HOLD"
+
+    def is_fundamental_exit(self, tick: OptionTick, tolerance: float = 0.01) -> bool:
+        """
+        Triggered when IV converges to RV (within tolerance). The vol-arb
+        opportunity has played out — flatten the position regardless of P&L.
+        """
+        if not tick or tick.implied_volatility <= 0:
+            return False
+        underlying = tick.symbol.rstrip("0123456789CP")
+        target_rv = self.target_rv_map.get(underlying, 0.20)
+        return abs(tick.implied_volatility - target_rv) <= tolerance
